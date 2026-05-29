@@ -7,23 +7,56 @@ export type LiveSnapshot = {
   nodes: Record<string, any>;
 };
 
-export function connectLiveFeed(url: string, onSnapshot: (snapshot: LiveSnapshot) => void, onError?: (event: Event) => void): WebSocket {
-  const socket = new WebSocket(url);
+type LiveFeedHandle = {
+  close: () => void;
+};
 
-  socket.onmessage = (message) => {
-    try {
-      const payload = JSON.parse(message.data);
-      if (payload.snapshot) {
-        onSnapshot(payload.snapshot);
+export function connectLiveFeed(
+  url: string,
+  onSnapshot: (snapshot: LiveSnapshot) => void,
+  onStatus?: (status: string) => void,
+): LiveFeedHandle {
+  let socket: WebSocket | null = null;
+  let closedByUser = false;
+  let retryMs = 1000;
+
+  const connect = () => {
+    onStatus?.('connecting');
+    socket = new WebSocket(url);
+
+    socket.onopen = () => {
+      retryMs = 1000;
+      onStatus?.('connected');
+    };
+
+    socket.onmessage = (message) => {
+      try {
+        const payload = JSON.parse(message.data);
+        if (payload.snapshot) onSnapshot(payload.snapshot);
+      } catch (error) {
+        console.warn('Invalid live feed payload', error);
       }
-    } catch (error) {
-      console.warn('Invalid live feed payload', error);
-    }
+    };
+
+    socket.onerror = () => {
+      onStatus?.('error');
+    };
+
+    socket.onclose = () => {
+      if (closedByUser) return;
+      onStatus?.('reconnecting');
+      const wait = retryMs;
+      retryMs = Math.min(retryMs * 2, 15000);
+      setTimeout(connect, wait);
+    };
   };
 
-  socket.onerror = (event) => {
-    if (onError) onError(event);
-  };
+  connect();
 
-  return socket;
+  return {
+    close: () => {
+      closedByUser = true;
+      socket?.close();
+    },
+  };
 }
