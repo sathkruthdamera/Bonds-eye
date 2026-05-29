@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import json
+import os
+import sqlite3
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from pathlib import Path
 from time import time
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Bonds-eye", version="0.2.0")
+app = FastAPI(title="Bonds-eye", version="0.3.0")
 
-EXPECTED_NODES = ["esp32s3-node-01", "esp32s3-node-02", "esp32s3-node-03"]
-READING_LIMIT = 500
-EVENT_LIMIT = 100
-NODE_OFFLINE_SECONDS = 20
+EXPECTED_NODES = [node.strip() for node in os.getenv("BONDSEYE_EXPECTED_NODES", "esp32s3-node-01,esp32s3-node-02,esp32s3-node-03").split(",") if node.strip()]
+API_KEY = os.getenv("BONDSEYE_API_KEY", "dev-change-me")
+DB_PATH = Path(os.getenv("BONDSEYE_DB_PATH", "/data/bondseye.sqlite3"))
+READING_LIMIT = int(os.getenv("BONDSEYE_READING_LIMIT", "500"))
+EVENT_LIMIT = int(os.getenv("BONDSEYE_EVENT_LIMIT", "100"))
+NODE_OFFLINE_SECONDS = int(os.getenv("BONDSEYE_NODE_OFFLINE_SECONDS", "20"))
+MIN_EVENT_GAP_MS = int(os.getenv("BONDSEYE_MIN_EVENT_GAP_MS", "2500"))
 
 readings: deque[dict[str, Any]] = deque(maxlen=READING_LIMIT)
 events: deque[dict[str, Any]] = deque(maxlen=EVENT_LIMIT)
@@ -21,6 +28,7 @@ clients: set[WebSocket] = set()
 node_state: dict[str, dict[str, Any]] = {}
 rssi_windows: dict[str, deque[int]] = defaultdict(lambda: deque(maxlen=20))
 last_sequences: dict[str, int] = {}
+last_event_ms = 0
 calibration_state: dict[str, Any] = {"active": False, "mode": None, "started_at_ms": None}
 
 
@@ -47,6 +55,31 @@ def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    if API_KEY and API_KEY != "dev-change-me" and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+
+def db() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS readings (id INTEGER PRIMARY KEY AUTOINCREMENT, node_id TEXT NOT NULL, rssi INTEGER NOT NULL, rssi_variance REAL NOT NULL, csi_variance REAL NOT NULL, packet_loss REAL NOT NULL, sequence INTEGER, timestamp_ms INTEGER NOT NULL, received_at_ms INTEGER NOT NULL)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_node_time ON readings(node_id, received_at_ms)")
+        conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, timestamp_ms INTEGER NOT NULL, confidence REAL, payload TEXT)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(timestamp_ms)")
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+
+
 def calculate_variance(values: deque[int]) -> float:
     if len(values) < 2:
         return 0.0
@@ -67,12 +100,22 @@ def estimate_packet_loss(node_id: str, sequence: int | None, provided: float | N
     return min(missing / max(sequence - previous, 1), 1.0)
 
 
+def persist_reading(reading: dict[str, Any]) -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO readings(node_id,rssi,rssi_variance,csi_variance,packet_loss,sequence,timestamp_ms,received_at_ms) VALUES(?,?,?,?,?,?,?,?)", (reading["node_id"], reading["rssi"], reading["rssi_variance"], reading["csi_variance"], reading["packet_loss"], reading.get("sequence"), reading["timestamp_ms"], reading["received_at_ms"]))
+
+
+def add_event(event: dict[str, Any]) -> None:
+    events.append(event)
+    with db() as conn:
+        conn.execute("INSERT INTO events(type,timestamp_ms,confidence,payload) VALUES(?,?,?,?)", (event["type"], event["timestamp_ms"], event.get("confidence"), json.dumps(event)))
+
+
 def process_snapshot() -> dict[str, Any]:
     active_nodes = []
     signal_disturbance = 0.0
     motion_intensity = 0.0
     current_ms = now_ms()
-
     for node_id, state in node_state.items():
         age_seconds = (current_ms - state["last_seen_ms"]) / 1000
         online = age_seconds <= NODE_OFFLINE_SECONDS
@@ -81,32 +124,17 @@ def process_snapshot() -> dict[str, Any]:
             active_nodes.append(node_id)
             signal_disturbance += float(state.get("rssi_variance", 0)) + float(state.get("csi_variance", 0))
             motion_intensity += max(0, min(100, abs(state.get("rssi", -80) + 70) * 2))
-
     node_count = len(active_nodes)
     normalized_disturbance = round(signal_disturbance / max(node_count, 1), 3)
     normalized_motion = round(motion_intensity / max(node_count, 1), 2)
     confidence = round(min(1.0, 0.25 + (node_count / max(len(EXPECTED_NODES), 1)) * 0.55 + min(normalized_disturbance / 20, 0.2)), 3)
     presence = node_count > 0 and (normalized_disturbance > 1.5 or normalized_motion > 8)
-
-    return {
-        "presence": presence,
-        "confidence": confidence,
-        "motion_intensity": normalized_motion,
-        "signal_disturbance": normalized_disturbance,
-        "pose_state": "not_supported_mvp",
-        "zone_state": "unknown",
-        "node_count": node_count,
-        "nodes": node_state,
-        "stick_figure": None,
-        "events": list(events)[-20:],
-        "calibration": calibration_state,
-        "server_time_ms": current_ms,
-    }
+    return {"presence": presence, "confidence": confidence, "motion_intensity": normalized_motion, "signal_disturbance": normalized_disturbance, "pose_state": "not_supported_mvp", "zone_state": "unknown", "node_count": node_count, "nodes": node_state, "stick_figure": None, "events": list(events)[-20:], "calibration": calibration_state, "server_time_ms": current_ms}
 
 
 async def broadcast(payload: dict[str, Any]) -> None:
     disconnected = []
-    for websocket in clients:
+    for websocket in list(clients):
         try:
             await websocket.send_json(payload)
         except Exception:
@@ -117,48 +145,29 @@ async def broadcast(payload: dict[str, Any]) -> None:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "nodes": len(node_state),
-        "expected_nodes": len(EXPECTED_NODES),
-        "server_time": utc_iso(),
-    }
+    return {"status": "ok", "nodes": len(node_state), "expected_nodes": len(EXPECTED_NODES), "db_path": str(DB_PATH), "server_time": utc_iso()}
 
 
-@app.post("/api/telemetry")
+@app.post("/api/telemetry", dependencies=[Depends(require_api_key)])
 async def ingest_telemetry(packet: TelemetryIn) -> dict[str, bool]:
+    global last_event_ms
     timestamp_ms = packet.timestamp_ms or now_ms()
     rssi_windows[packet.node_id].append(packet.rssi)
     rssi_variance = packet.rssi_variance if packet.rssi_variance is not None else calculate_variance(rssi_windows[packet.node_id])
     packet_loss = estimate_packet_loss(packet.node_id, packet.sequence, packet.packet_loss)
-
-    normalized = {
-        "node_id": packet.node_id,
-        "rssi": packet.rssi,
-        "rssi_variance": round(rssi_variance, 4),
-        "csi_variance": round(packet.csi_variance or 0.0, 4),
-        "packet_loss": round(packet_loss, 4),
-        "sequence": packet.sequence,
-        "timestamp_ms": timestamp_ms,
-        "received_at_ms": now_ms(),
-    }
+    normalized = {"node_id": packet.node_id, "rssi": packet.rssi, "rssi_variance": round(rssi_variance, 4), "csi_variance": round(packet.csi_variance or 0.0, 4), "packet_loss": round(packet_loss, 4), "sequence": packet.sequence, "timestamp_ms": timestamp_ms, "received_at_ms": now_ms()}
     readings.append(normalized)
-    node_state[packet.node_id] = {
-        **normalized,
-        "last_seen_ms": now_ms(),
-        "online": True,
-        "health": "ok" if packet_loss < 0.15 else "degraded",
-    }
-
+    persist_reading(normalized)
+    node_state[packet.node_id] = {**normalized, "last_seen_ms": now_ms(), "online": True, "health": "ok" if packet_loss < 0.15 else "degraded"}
     snapshot = process_snapshot()
-    if snapshot["presence"]:
-        events.append({"type": "presence_or_motion", "timestamp_ms": now_ms(), "confidence": snapshot["confidence"]})
-
+    if snapshot["presence"] and now_ms() - last_event_ms >= MIN_EVENT_GAP_MS:
+        last_event_ms = now_ms()
+        add_event({"type": "presence_or_motion", "timestamp_ms": last_event_ms, "confidence": snapshot["confidence"]})
     await broadcast({"type": "telemetry", "reading": normalized, "snapshot": snapshot})
     return {"accepted": True}
 
 
-@app.post("/telemetry")
+@app.post("/telemetry", dependencies=[Depends(require_api_key)])
 async def legacy_ingest(packet: TelemetryIn) -> dict[str, bool]:
     return await ingest_telemetry(packet)
 
@@ -186,20 +195,15 @@ def recent_readings() -> list[dict[str, Any]]:
 
 @app.post("/api/calibrate/start")
 def start_calibration(request: CalibrationStart) -> dict[str, Any]:
-    calibration_state.update({
-        "active": True,
-        "mode": request.mode,
-        "duration_seconds": request.duration_seconds,
-        "started_at_ms": now_ms(),
-    })
-    events.append({"type": "calibration_started", "mode": request.mode, "timestamp_ms": now_ms()})
+    calibration_state.update({"active": True, "mode": request.mode, "duration_seconds": request.duration_seconds, "started_at_ms": now_ms()})
+    add_event({"type": "calibration_started", "mode": request.mode, "timestamp_ms": now_ms()})
     return {"started": True, "calibration": calibration_state}
 
 
 @app.post("/api/calibrate/stop")
 def stop_calibration() -> dict[str, Any]:
     calibration_state.update({"active": False, "stopped_at_ms": now_ms()})
-    events.append({"type": "calibration_stopped", "timestamp_ms": now_ms()})
+    add_event({"type": "calibration_stopped", "timestamp_ms": now_ms()})
     return {"stopped": True, "calibration": calibration_state}
 
 
