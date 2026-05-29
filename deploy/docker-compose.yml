@@ -1,6 +1,14 @@
 services:
   api:
     build: ../api
+    environment:
+      BONDSEYE_DB_PATH: /data/bondseye.sqlite3
+      BONDSEYE_API_KEY: change-me
+    volumes:
+      - bondseye_data:/data
     ports:
       - "8080:8080"
     restart: unless-stopped
+
+volumes:
+  bondseye_data:
