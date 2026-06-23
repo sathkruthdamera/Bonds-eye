@@ -98,4 +98,6 @@ void loop() {
     lastSampleMs = millis();
     sendTelemetry();
   }
+  // Yield to the RTOS instead of busy-spinning between samples.
+  delay(10);
 }

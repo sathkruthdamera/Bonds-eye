@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import queue
 import sqlite3
 import threading
 from collections import defaultdict, deque
@@ -24,6 +26,9 @@ READING_LIMIT = int(os.getenv("BONDSEYE_READING_LIMIT", "500"))
 EVENT_LIMIT = int(os.getenv("BONDSEYE_EVENT_LIMIT", "100"))
 NODE_OFFLINE_SECONDS = int(os.getenv("BONDSEYE_NODE_OFFLINE_SECONDS", "20"))
 MIN_EVENT_GAP_MS = int(os.getenv("BONDSEYE_MIN_EVENT_GAP_MS", "2500"))
+BROADCAST_MIN_INTERVAL_MS = int(os.getenv("BONDSEYE_BROADCAST_MIN_INTERVAL_MS", "150"))
+WRITE_QUEUE_MAX = int(os.getenv("BONDSEYE_WRITE_QUEUE_MAX", "10000"))
+WRITE_BATCH_MAX = int(os.getenv("BONDSEYE_WRITE_BATCH_MAX", "200"))
 
 readings: deque[dict[str, Any]] = deque(maxlen=READING_LIMIT)
 events: deque[dict[str, Any]] = deque(maxlen=EVENT_LIMIT)
@@ -32,6 +37,7 @@ node_state: dict[str, dict[str, Any]] = {}
 rssi_windows: dict[str, deque[int]] = defaultdict(lambda: deque(maxlen=20))
 last_sequences: dict[str, int] = {}
 last_event_ms = 0
+last_broadcast_ms = 0
 calibration_state: dict[str, Any] = {"active": False, "mode": None, "started_at_ms": None}
 
 
@@ -90,6 +96,37 @@ def init_db(conn: sqlite3.Connection) -> None:
 CONN = _connect()
 init_db(CONN)
 
+# Reading writes are pushed onto a queue and flushed in batches by a background
+# daemon thread, so the request path never blocks on disk I/O or commit().
+_write_queue: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=WRITE_QUEUE_MAX)
+
+
+def _writer_loop() -> None:
+    while True:
+        batch = [_write_queue.get()]
+        while len(batch) < WRITE_BATCH_MAX:
+            try:
+                batch.append(_write_queue.get_nowait())
+            except queue.Empty:
+                break
+        rows = [
+            (r["node_id"], r["rssi"], r["rssi_variance"], r["csi_variance"], r["packet_loss"], r.get("sequence"), r["timestamp_ms"], r["received_at_ms"])
+            for r in batch
+        ]
+        try:
+            with _db_lock:
+                CONN.executemany(
+                    "INSERT INTO readings(node_id,rssi,rssi_variance,csi_variance,packet_loss,sequence,timestamp_ms,received_at_ms) VALUES(?,?,?,?,?,?,?,?)",
+                    rows,
+                )
+                CONN.commit()
+        except Exception:  # pragma: no cover - background writer must not die
+            pass
+
+
+_writer_thread = threading.Thread(target=_writer_loop, name="bondseye-db-writer", daemon=True)
+_writer_thread.start()
+
 
 def calculate_variance(values: deque[int]) -> float:
     if len(values) < 2:
@@ -112,9 +149,12 @@ def estimate_packet_loss(node_id: str, sequence: int | None, provided: float | N
 
 
 def persist_reading(reading: dict[str, Any]) -> None:
-    with _db_lock:
-        CONN.execute("INSERT INTO readings(node_id,rssi,rssi_variance,csi_variance,packet_loss,sequence,timestamp_ms,received_at_ms) VALUES(?,?,?,?,?,?,?,?)", (reading["node_id"], reading["rssi"], reading["rssi_variance"], reading["csi_variance"], reading["packet_loss"], reading.get("sequence"), reading["timestamp_ms"], reading["received_at_ms"]))
-        CONN.commit()
+    # Non-blocking: hand off to the background writer. Shed load instead of
+    # stalling ingest if the queue is ever saturated.
+    try:
+        _write_queue.put_nowait(reading)
+    except queue.Full:
+        pass
 
 
 def add_event(event: dict[str, Any]) -> None:
@@ -168,14 +208,13 @@ def process_snapshot() -> dict[str, Any]:
 
 
 async def broadcast(payload: dict[str, Any]) -> None:
-    disconnected = []
-    for websocket in list(clients):
-        try:
-            await websocket.send_json(payload)
-        except Exception:
-            disconnected.append(websocket)
-    for websocket in disconnected:
-        clients.discard(websocket)
+    targets = list(clients)
+    if not targets:
+        return
+    results = await asyncio.gather(*(ws.send_json(payload) for ws in targets), return_exceptions=True)
+    for websocket, result in zip(targets, results):
+        if isinstance(result, Exception):
+            clients.discard(websocket)
 
 
 @app.get("/health")
@@ -185,7 +224,7 @@ def health() -> dict[str, Any]:
 
 @app.post("/api/telemetry", dependencies=[Depends(require_api_key)])
 async def ingest_telemetry(packet: TelemetryIn) -> dict[str, bool]:
-    global last_event_ms
+    global last_event_ms, last_broadcast_ms
     timestamp_ms = packet.timestamp_ms or now_ms()
     rssi_windows[packet.node_id].append(packet.rssi)
     rssi_variance = packet.rssi_variance if packet.rssi_variance is not None else calculate_variance(rssi_windows[packet.node_id])
@@ -195,10 +234,16 @@ async def ingest_telemetry(packet: TelemetryIn) -> dict[str, bool]:
     persist_reading(normalized)
     node_state[packet.node_id] = {**normalized, "last_seen_ms": now_ms(), "online": True, "health": "ok" if packet_loss < 0.15 else "degraded"}
     snapshot = process_snapshot()
+    event_added = False
     if snapshot["presence"] and now_ms() - last_event_ms >= MIN_EVENT_GAP_MS:
         last_event_ms = now_ms()
         add_event({"type": "presence_or_motion", "timestamp_ms": last_event_ms, "confidence": snapshot["confidence"]})
-    await broadcast({"type": "telemetry", "reading": normalized, "snapshot": snapshot})
+        event_added = True
+    # Decouple the live fan-out rate from the ingest rate: push on a capped
+    # interval, but always push immediately when a presence event fires.
+    if event_added or now_ms() - last_broadcast_ms >= BROADCAST_MIN_INTERVAL_MS:
+        last_broadcast_ms = now_ms()
+        await broadcast({"type": "telemetry", "reading": normalized, "snapshot": snapshot})
     return {"accepted": True}
 
 
