@@ -21,6 +21,7 @@ ESP32-S3 Node 3  /
 - RSSI/CSI variance
 - Event alerts
 - Confidence score
+- Abstract stick-figure avatar (pose state + zone state, RF-derived — not a real skeleton)
 - WebSocket live feed for mobile
 - Docker-ready backend for Hostinger KVM
 - ESP32-S3 firmware template
@@ -77,3 +78,8 @@ wss://your-domain.com/ws/live
 ## Status
 
 This is a configured MVP scaffold. Hardware-specific CSI extraction may require adjustment based on your exact ESP32-S3 board, ESP-IDF version, and antenna behavior.
+
+The Phase-2 scoring engine is now wired into the live API: each snapshot emits
+`pose_state`, `zone_state`, and a `stick_figure` object, and the mobile app
+renders the avatar. The pose/zone thresholds in `api/phase2_scoring_engine.py`
+are heuristic and should be calibrated in your real room.

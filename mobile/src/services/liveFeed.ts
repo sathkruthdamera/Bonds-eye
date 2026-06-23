@@ -1,10 +1,22 @@
+export type StickFigure = {
+  mode: string;
+  zone: string;
+  x: number;
+  y: number;
+  motion: number;
+  confidence: number;
+};
+
 export type LiveSnapshot = {
   presence: boolean;
   confidence: number;
   motion_intensity: number;
   signal_disturbance: number;
+  pose_state: string;
+  zone_state: string;
   node_count: number;
   nodes: Record<string, any>;
+  stick_figure: StickFigure | null;
 };
 
 type LiveFeedHandle = {
