@@ -54,6 +54,32 @@ Then check:
 curl http://YOUR_SERVER_IP:8080/health
 ```
 
+## Local testing without hardware
+
+You can exercise the full pipeline (simulated nodes -> gateway -> API -> mobile)
+with no ESP32 boards using the node simulator.
+
+```bash
+# terminal 1: API
+cd api && uvicorn main:app --port 8080
+
+# terminal 2: gateway (relays UDP -> API)
+cd gateway && python udp_gateway.py --api-url http://127.0.0.1:8080/api/telemetry
+
+# terminal 3: simulate the 3 nodes (rotates pose/zone states)
+cd gateway && python simulator.py --scenario cycle
+```
+
+The simulator can also POST straight to the API, skipping the gateway:
+
+```bash
+python simulator.py --api-url http://127.0.0.1:8080/api/telemetry --api-key dev-change-me
+```
+
+Scenarios: `empty` (NO_PERSON), `still` (STANDING_STILL), `walking` (MOVING),
+`crouch` (CROUCH_LIKE), and `cycle` (rotates them and sweeps zones). Use
+`--sweep` with a fixed scenario to move the active node across LEFT/CENTER/RIGHT.
+
 ## ESP32-S3 target behavior
 
 Each ESP32-S3 connects to the T-Mobile hotspot, samples RSSI/CSI features, and sends compact telemetry packets to either:
